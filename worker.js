@@ -5,6 +5,7 @@
 //    GET  /store/KOD         → wszystkie obiekty pokoju (czytać może każdy)
 //    GET  /store/KOD?meta=1  → tylko lista (do znaczka „nowe” u znajomych)
 //    POST /store/KOD         → zmiany — tylko właściciel z tajnym kluczem: claim / put / del / owner / auth
+//                              wyjątek: op 'dl' (licznik pobrań) — każdy gość, jedna osoba liczy się przy danym assecie raz
 
 const MAX_OBJS = 300, MAX_OBJ = 1500000;
 
@@ -43,13 +44,23 @@ export class Room {
     const meta = await S.get('meta');
     if (request.method === 'GET') {
       if (!meta) return J({ ok: 0, none: 1 });
-      if (url.searchParams.get('meta')) return J({ ok: 1, owner: meta.owner, ids: meta.ids, upd: meta.upd });
+      if (url.searchParams.get('meta')) return J({ ok: 1, owner: meta.owner, ids: meta.ids, upd: meta.upd, tot: meta.tot || 0 });
       const objs = [];
-      for (const it of meta.ids) { const d = await S.get('o:' + it.id); if (d) objs.push({ id: it.id, t: it.t, d }); }
-      return J({ ok: 1, owner: meta.owner, objs, upd: meta.upd });
+      for (const it of meta.ids) { const d = await S.get('o:' + it.id); if (d) objs.push({ id: it.id, t: it.t, d, dl: it.dl || 0 }); }
+      return J({ ok: 1, owner: meta.owner, objs, upd: meta.upd, tot: meta.tot || 0 });
     }
     if (request.method !== 'POST') return J({ ok: 0, err: 'metoda' }, 405);
     let b; try { b = JSON.parse(await request.text()); } catch (e) { return J({ ok: 0, err: 'zły JSON' }, 400); }
+    if (b && b.op === 'dl') { // 📥 pobranie assetu przez gościa
+      const id = String(b.id || ''), u = String(b.u || '');
+      if (!meta || !/^[A-Za-z0-9_-]{8,40}$/.test(u)) return J({ ok: 0, err: 'brak' }, 400);
+      const it = meta.ids.find(x => x.id === id); if (!it) return J({ ok: 0, err: 'nie ma obiektu' }, 404);
+      const who = (await S.get('d:' + id)) || [];
+      if (who.indexOf(u) >= 0) return J({ ok: 1, dl: it.dl || 0, tot: meta.tot || 0, counted: 0 });
+      if (who.length < 20000) { who.push(u); await S.put('d:' + id, who); }
+      it.dl = (it.dl || 0) + 1; meta.tot = (meta.tot || 0) + 1; await S.put('meta', meta);
+      return J({ ok: 1, dl: it.dl, tot: meta.tot, counted: 1 });
+    }
     if (!b || typeof b.k !== 'string' || b.k.length < 16 || b.k.length > 80) return J({ ok: 0, err: 'brak klucza' }, 400);
     const h = await sha(b.k), owner = String(b.owner || '').slice(0, 24);
     if (b.op === 'claim') {
@@ -63,14 +74,14 @@ export class Room {
     if (!/^[A-Za-z0-9_-]{1,40}$/.test(id)) return J({ ok: 0, err: 'zły id' }, 400);
     if (b.op === 'put') {
       if (typeof b.d !== 'string' || b.d.length > MAX_OBJ) return J({ ok: 0, err: 'obiekt za duży' }, 413);
-      const i = meta.ids.findIndex(x => x.id === id), it = { id, t: +b.t || Date.now(), n: String(b.n || '').slice(0, 40) };
+      const i = meta.ids.findIndex(x => x.id === id), it = { id, t: +b.t || Date.now(), n: String(b.n || '').slice(0, 40), dl: i >= 0 ? (meta.ids[i].dl || 0) : 0 };
       if (i < 0 && meta.ids.length >= MAX_OBJS) return J({ ok: 0, err: 'pokój pełny' }, 409);
       if (i < 0) meta.ids.push(it); else meta.ids[i] = it;
       meta.upd = Date.now(); await S.put('o:' + id, b.d); await S.put('meta', meta); return J({ ok: 1 });
     }
     if (b.op === 'del') {
       meta.ids = meta.ids.filter(x => x.id !== id); meta.upd = Date.now();
-      await S.delete('o:' + id); await S.put('meta', meta); return J({ ok: 1 });
+      await S.delete('o:' + id); await S.delete('d:' + id); await S.put('meta', meta); return J({ ok: 1 });
     }
     return J({ ok: 0, err: 'nieznana operacja' }, 400);
   }
