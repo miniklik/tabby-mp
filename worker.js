@@ -5,6 +5,11 @@ var __name = (target, value) => __defProp(target, "name", { value, configurable:
 var MAX_OBJS = 300;
 var MAX_OBJ = 15e5;
 var MAX_PODPIS = 1e5;
+// 🌍 gry udostępnione kodem: plansza (dane) do 4 MB, w kawałkach po 1 MB; nowe gry — limit na godzinę z jednego adresu
+var MAX_GRA = 4e6;
+var GRA_CH = 1e6;
+var GRA_LIM = 20;
+var GRA_ABC = "BCDFGHJKLMNPQRSTVWXZ23456789"; // bez samogłosek (żadnych słów w kodzie) i bez 0/O, 1/I
 async function sha(s) {
   const b = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
@@ -27,8 +32,8 @@ var Room = class {
       server.send(JSON.stringify({ t: "_n", n }));
       return new Response(null, { status: 101, webSocket: client });
     }
-    const P = new URL(request.url).pathname, L = P.startsWith("/licznik/"), SC = P.startsWith("/sciana/");
-    const run = this.q.then(() => L ? this.licznik(request) : SC ? this.sciana(request) : this.store(request));
+    const P = new URL(request.url).pathname, L = P.startsWith("/licznik/"), SC = P.startsWith("/sciana/"), G = P.startsWith("/gra/"), LM = P.startsWith("/lim/");
+    const run = this.q.then(() => L ? this.licznik(request) : SC ? this.sciana(request) : G ? this.gra(request) : LM ? this.lim(request) : this.store(request));
     this.q = run.catch(() => {
     });
     return run;
@@ -105,6 +110,58 @@ var Room = class {
       return J({ ok: 1 });
     }
     return J({ ok: 0, err: "nieznana operacja" }, 400);
+  }
+  // ---------- 🌍 limit nowych gier z jednego adresu (na godzinę) ----------
+  async lim(request) {
+    const S = this.ctx.storage, hr = Math.floor(Date.now() / 36e5);
+    let o = await S.get("o") || { hr, n: 0 };
+    if (o.hr !== hr) o = { hr, n: 0 };
+    if (o.n >= GRA_LIM) return J({ ok: 0 });
+    o.n++;
+    await S.put("o", o);
+    return J({ ok: 1 });
+  }
+  // ---------- 🌍 gra udostępniona kodem: GET = zagraj (?meta=1 tylko nazwa i autor), POST new/put/del = autor (klucz) ----------
+  async gra(request) {
+    const S = this.ctx.storage, url = new URL(request.url);
+    const meta = await S.get("meta");
+    if (request.method === "GET") {
+      if (!meta) return J({ ok: 0, none: 1 });
+      const inf = { ok: 1, n: meta.n, a: meta.a, m: meta.m, t: meta.t, upd: meta.upd, g: meta.g || 0 };
+      if (url.searchParams.get("meta")) return J(inf);
+      let d = "";
+      for (let i = 0; i < meta.parts; i++) d += await S.get("c:" + i) || "";
+      if (url.searchParams.get("play")) {
+        meta.g = (meta.g || 0) + 1;
+        await S.put("meta", meta);
+        inf.g = meta.g;
+      }
+      inf.d = d;
+      return J(inf);
+    }
+    if (request.method !== "POST") return J({ ok: 0, err: "metoda" }, 405);
+    let b;
+    try {
+      b = JSON.parse(await request.text());
+    } catch (e) {
+      return J({ ok: 0, err: "z\u0142y JSON" }, 400);
+    }
+    if (!b || typeof b.k !== "string" || b.k.length < 16 || b.k.length > 80) return J({ ok: 0, err: "brak klucza" }, 400);
+    const h = await sha(b.k);
+    if (b.op === "new" && meta) return J({ ok: 0, taken: 1 });
+    if (b.op !== "new" && (!meta || meta.h !== h)) return J({ ok: 0, err: meta ? "z\u0142y klucz" : "nie ma takiej gry" }, meta ? 403 : 404);
+    if (b.op === "del") {
+      await S.deleteAll();
+      return J({ ok: 1 });
+    }
+    if (b.op !== "new" && b.op !== "put") return J({ ok: 0, err: "nieznana operacja" }, 400);
+    if (typeof b.d !== "string" || b.d.length < 10 || b.d.length > MAX_GRA) return J({ ok: 0, err: "gra za du\u017Ca" }, 413);
+    const parts = Math.ceil(b.d.length / GRA_CH), old = meta ? meta.parts : 0;
+    for (let i = 0; i < parts; i++) await S.put("c:" + i, b.d.slice(i * GRA_CH, (i + 1) * GRA_CH));
+    for (let i = parts; i < old; i++) await S.delete("c:" + i);
+    const m = { h, n: String(b.n || "").slice(0, 40) || "Gra", a: String(b.a || "").slice(0, 30), m: b.m === "razem" ? "razem" : "sam", t: meta ? meta.t : Date.now(), upd: Date.now(), parts, g: meta ? meta.g || 0 : 0 };
+    await S.put("meta", m);
+    return J({ ok: 1 });
   }
   // ---------- pamięć pokoju ----------
   async store(request) {
@@ -194,6 +251,41 @@ var worker_default = {
     const txt = { ...CORS, "Content-Type": "text/plain; charset=utf-8" };
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
     if (url.pathname === "/" || url.pathname === "/ping") return new Response("Tabby MP OK", { headers: txt });
+    if (url.pathname === "/gra" && request.method === "POST") {
+      const ip = request.headers.get("CF-Connecting-IP") || "x";
+      const lr = await (await env.ROOMS.get(env.ROOMS.idFromName("lim:" + ip)).fetch(new Request(url.origin + "/lim/", { method: "POST" }))).json();
+      if (!lr.ok) return J({ ok: 0, err: "Za du\u017Co nowych gier \u2014 spr\xF3buj za godzin\u0119" }, 429);
+      const body = await request.text();
+      if (body.length > MAX_GRA + 2e4) return J({ ok: 0, err: "gra za du\u017Ca" }, 413);
+      let b;
+      try {
+        b = JSON.parse(body);
+      } catch (e) {
+        return J({ ok: 0, err: "z\u0142y JSON" }, 400);
+      }
+      b.op = "new";
+      const nb = JSON.stringify(b);
+      for (let t = 0; t < 8; t++) {
+        let kod = "";
+        const r = crypto.getRandomValues(new Uint8Array(6));
+        for (let i = 0; i < 6; i++) kod += GRA_ABC[r[i] % GRA_ABC.length];
+        const res = await env.ROOMS.get(env.ROOMS.idFromName("gra:" + kod)).fetch(new Request(url.origin + "/gra/" + kod, { method: "POST", body: nb }));
+        const o = await res.json();
+        if (o.taken) continue;
+        if (o.ok) o.kod = kod;
+        return J(o, res.status);
+      }
+      return J({ ok: 0, err: "spr\xF3buj jeszcze raz" }, 503);
+    }
+    const gm = url.pathname.match(/^\/gra\/([A-Z0-9]{6})$/);
+    if (gm) {
+      const st = env.ROOMS.get(env.ROOMS.idFromName("gra:" + gm[1]));
+      if (request.method !== "POST") return st.fetch(request);
+      const body = await request.text();
+      if (body.length > MAX_GRA + 2e4) return J({ ok: 0, err: "gra za du\u017Ca" }, 413);
+      if (/"op"\s*:\s*"new"/.test(body)) return J({ ok: 0, err: "nowa gra tylko przez /gra" }, 400);
+      return st.fetch(new Request(request.url, { method: "POST", body }));
+    }
     if (url.pathname === "/licznik/alicja") return env.ROOMS.get(env.ROOMS.idFromName("licznik:alicja")).fetch(request);
     const sc = url.pathname.match(/^\/sciana\/([a-z0-9-]{1,40})$/);
     if (sc) return env.ROOMS.get(env.ROOMS.idFromName("sciana:" + sc[1])).fetch(request);
